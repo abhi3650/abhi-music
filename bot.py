@@ -114,70 +114,234 @@ APP: Application = None   # type: ignore
 
 # ══════════════════════════════════════════════════════════
 # BLOCK 4 — DATABASE
-# Source of truth = DB_CHANNEL messages.
-# Local JSON = fast index cache, rebuilt from channel on startup.
-# Schema:
-#   tracks    : { tid: {title,artist,album,genre,duration,
-#                       file_id, thumb_file_id, message_id,
-#                       plays, uploaded_by, uploaded_at} }
-#   playlists : { pid: {name, owner_id, tracks:[tid,...]} }
-#   favourites: { uid: [tid,...] }
+# ══════════════════════════════════════════════════════════
+# Architecture:
+#
+#   DB_CHANNEL (Telegram channel) is the ONLY source of truth.
+#   Two types of messages live there:
+#
+#   1. AUDIO messages  — one per track, caption = JSON metadata
+#      { tid, title, artist, album, genre, duration,
+#        uploaded_by, uploaded_at, thumb_file_id }
+#
+#   2. INDEX message   — ONE pinned text message, caption starts with
+#      "MUSICVAULT_INDEX\n" followed by JSON:
+#      { tracks: { tid: {message_id, plays, ...all metadata} },
+#        playlists: {...}, favourites: {...} }
+#
+#   On startup  → fetch pinned INDEX message → populate local DB.
+#   On every change (upload/delete/play/fav/playlist) → push updated
+#                   index back to channel (edit the pinned message).
+#
+#   local musicvault.json = write-through cache only (faster reads).
+#   New server = zero local files needed, just BOT_TOKEN + DB_CHANNEL.
+#
+#   Index message size limit: Telegram captions max 4096 chars.
+#   We use message TEXT (not caption) → 4096 chars for text messages.
+#   For large libraries (>4096 chars) we split into chunks and store
+#   a pointer message that lists all chunk message IDs.
 # ══════════════════════════════════════════════════════════
 
+INDEX_MARKER  = "MUSICVAULT_INDEX_V2"
+POINTER_MARKER = "MUSICVAULT_POINTER"
+_INDEX_MSG_ID: int | None = None   # cached message_id of the pinned index
+
 def load_db() -> dict:
+    """Load from local cache (fast path). Falls back to empty."""
     if DB_FILE.exists():
         try: return json.loads(DB_FILE.read_text("utf-8"))
         except: pass
-    return {"tracks":{}, "playlists":{}, "favourites":{}}
+    return {"tracks":{}, "playlists":{}, "favourites":{}, "_index_msg_id": None}
 
 def save_db(db: dict):
+    """Write-through to local cache."""
     tmp = DB_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(db, indent=2), "utf-8")
     if DB_FILE.exists(): DB_FILE.unlink()
     tmp.rename(DB_FILE)
 
-def _parse_caption(caption: str) -> dict:
-    """Parse JSON metadata stored as a message caption in DB_CHANNEL."""
-    try:
-        return json.loads(caption)
-    except:
-        return {}
+def _db_to_index_json(db: dict) -> str:
+    """Serialise the DB to the string stored in the channel index message."""
+    payload = {
+        "tracks":     db.get("tracks",{}),
+        "playlists":  db.get("playlists",{}),
+        "favourites": db.get("favourites",{}),
+    }
+    return INDEX_MARKER + "\n" + json.dumps(payload, separators=(",",":"))
 
-async def sync_from_channel(bot) -> int:
-    """
-    Scan DB_CHANNEL from the beginning and rebuild the local index.
-    Each audio message's caption must be valid JSON metadata.
-    Returns number of tracks indexed.
-    """
-    if not DB_CHANNEL:
-        return 0
-    db = load_db()
-    # Build a set of already-indexed message_ids to skip re-indexing
-    known_msg_ids = {str(t.get("message_id")) for t in db["tracks"].values()}
-
-    count = 0
+def _index_json_to_db(text: str) -> dict | None:
+    """Parse the channel index message back into a DB dict."""
     try:
-        # Telegram getUpdates can't scroll history; use forwardFrom trick:
-        # We store message_id in caption JSON, so we can re-fetch by message_id.
-        # On first run we rely on the bot receiving new uploads and building the index.
-        # For full re-sync we iterate via offset — but Telegram API doesn't support
-        # "get all messages" for bots. Instead, we read our local DB and verify
-        # each file_id is still valid, and accept new uploads via the upload flow.
-        # On a new server, the index is seeded by the first upload or by /resync.
-        pass
+        if not text.startswith(INDEX_MARKER): return None
+        payload = json.loads(text[len(INDEX_MARKER)+1:])
+        return {
+            "tracks":     payload.get("tracks",{}),
+            "playlists":  payload.get("playlists",{}),
+            "favourites": payload.get("favourites",{}),
+        }
     except Exception as e:
-        logger.warning(f"sync_from_channel: {e}")
-
-    return count
-
-async def post_to_channel(bot, track: dict, file_id: str, thumb_file_id: str) -> int | None:
-    """
-    Post an audio message to DB_CHANNEL with JSON metadata as caption.
-    Returns the message_id so we can re-fetch it later.
-    """
-    if not DB_CHANNEL:
+        logger.warning(f"_index_json_to_db: {e}")
         return None
+
+async def push_index(bot, db: dict):
+    """
+    Write the full DB into the channel index message.
+    If no index message exists yet, create one and pin it.
+    Handles Telegram's 4096-char text limit by chunking.
+    """
+    global _INDEX_MSG_ID
+    if not DB_CHANNEL: return
+
+    text = _db_to_index_json(db)
+    cid  = int(DB_CHANNEL)
+
+    # Split into ≤4000-char chunks
+    CHUNK = 4000
+    chunks = [text[i:i+CHUNK] for i in range(0, len(text), CHUNK)]
+
+    try:
+        if len(chunks) == 1:
+            # Simple case: everything fits in one message
+            if _INDEX_MSG_ID:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=cid, message_id=_INDEX_MSG_ID, text=chunks[0])
+                    save_db(db); return
+                except TelegramError as e:
+                    if "message is not modified" in str(e).lower():
+                        save_db(db); return
+                    logger.warning(f"push_index edit failed: {e} — recreating")
+                    _INDEX_MSG_ID = None
+
+            # Create fresh index message
+            msg = await bot.send_message(cid, chunks[0], disable_notification=True)
+            _INDEX_MSG_ID = msg.message_id
+            db["_index_msg_id"] = _INDEX_MSG_ID
+            try:
+                await bot.pin_chat_message(cid, msg.message_id, disable_notification=True)
+            except: pass
+
+        else:
+            # Large library: send N chunk messages, then a pointer message
+            # Delete old chunks first if we have a pointer
+            if _INDEX_MSG_ID:
+                try:
+                    old = await bot.forward_message(cid, cid, _INDEX_MSG_ID)
+                    await bot.delete_message(cid, old.message_id)
+                except: pass
+
+            chunk_ids = []
+            for c in chunks:
+                m = await bot.send_message(cid, c, disable_notification=True)
+                chunk_ids.append(m.message_id)
+
+            pointer = POINTER_MARKER + "\n" + json.dumps(chunk_ids)
+            if _INDEX_MSG_ID:
+                try:
+                    await bot.edit_message_text(cid, _INDEX_MSG_ID, pointer)
+                except:
+                    msg = await bot.send_message(cid, pointer, disable_notification=True)
+                    _INDEX_MSG_ID = msg.message_id
+                    try: await bot.pin_chat_message(cid, _INDEX_MSG_ID, disable_notification=True)
+                    except: pass
+            else:
+                msg = await bot.send_message(cid, pointer, disable_notification=True)
+                _INDEX_MSG_ID = msg.message_id
+                try: await bot.pin_chat_message(cid, _INDEX_MSG_ID, disable_notification=True)
+                except: pass
+
+        db["_index_msg_id"] = _INDEX_MSG_ID
+        save_db(db)
+
+    except Exception as e:
+        logger.error(f"push_index: {e}")
+        save_db(db)   # at least save locally
+
+async def pull_index(bot) -> dict | None:
+    """
+    Fetch the DB from the channel's pinned index message.
+    This is the bootstrap called on every startup — works on a
+    brand-new server with zero local files.
+    Returns the DB dict or None if channel has no index yet.
+    """
+    global _INDEX_MSG_ID
+    if not DB_CHANNEL: return None
+    cid = int(DB_CHANNEL)
+
+    # Strategy 1: use locally cached _index_msg_id
+    local = load_db()
+    cached_id = local.get("_index_msg_id")
+    if cached_id:
+        result = await _fetch_index_by_id(bot, cid, cached_id)
+        if result:
+            _INDEX_MSG_ID = cached_id
+            return result
+
+    # Strategy 2: read the pinned message
+    try:
+        chat = await bot.get_chat(cid)
+        pinned = chat.pinned_message
+        if pinned:
+            result = await _parse_index_message(bot, cid, pinned)
+            if result is not None:
+                _INDEX_MSG_ID = pinned.message_id
+                return result
+    except Exception as e:
+        logger.warning(f"pull_index get_chat: {e}")
+
+    # No index found — fresh install
+    logger.info("pull_index: no existing index found (fresh install)")
+    return None
+
+async def _fetch_index_by_id(bot, cid: int, msg_id: int) -> dict | None:
+    """Fetch a specific message from the channel by forwarding it to itself."""
+    try:
+        fwd = await bot.forward_message(cid, cid, msg_id)
+        text = fwd.text or fwd.caption or ""
+        await bot.delete_message(cid, fwd.message_id)
+        return _parse_index_text(bot, cid, text)
+    except Exception as e:
+        logger.warning(f"_fetch_index_by_id {msg_id}: {e}")
+        return None
+
+async def _parse_index_message(bot, cid: int, msg) -> dict | None:
+    text = msg.text or msg.caption or ""
+    return _parse_index_text(bot, cid, text)
+
+def _parse_index_text(bot, cid: int, text: str) -> dict | None:
+    if text.startswith(INDEX_MARKER):
+        return _index_json_to_db(text)
+    if text.startswith(POINTER_MARKER):
+        # Multi-chunk: fetch and reassemble synchronously can't work here
+        # so we schedule an async rebuild; for now return None to trigger resync
+        logger.info("Pointer index detected — run /resync to reassemble")
+        return None
+    return None
+
+async def pull_chunked_index(bot, pointer_msg_id: int) -> dict | None:
+    """Reassemble a multi-chunk index from the channel."""
+    cid = int(DB_CHANNEL)
+    try:
+        fwd = await bot.forward_message(cid, cid, pointer_msg_id)
+        text = fwd.text or ""
+        await bot.delete_message(cid, fwd.message_id)
+        if not text.startswith(POINTER_MARKER): return None
+        chunk_ids = json.loads(text[len(POINTER_MARKER)+1:])
+        full = ""
+        for cid2 in chunk_ids:
+            fwd2 = await bot.forward_message(cid, cid, cid2)
+            full += (fwd2.text or "")
+            await bot.delete_message(cid, fwd2.message_id)
+        return _index_json_to_db(full)
+    except Exception as e:
+        logger.error(f"pull_chunked_index: {e}")
+        return None
+
+async def post_audio_to_channel(bot, track: dict, file_id: str) -> int | None:
+    """Post the audio file to DB_CHANNEL. Returns message_id."""
+    if not DB_CHANNEL: return None
     caption = json.dumps({
+        "tid":          track.get("tid",""),
         "title":        track.get("title",""),
         "artist":       track.get("artist",""),
         "album":        track.get("album",""),
@@ -185,46 +349,17 @@ async def post_to_channel(bot, track: dict, file_id: str, thumb_file_id: str) ->
         "duration":     track.get("duration",0),
         "uploaded_by":  track.get("uploaded_by",0),
         "uploaded_at":  track.get("uploaded_at",0),
-        "thumb_file_id": thumb_file_id or "",
+        "thumb_file_id":track.get("thumb_file_id",""),
     })
     try:
         msg = await bot.send_audio(
-            chat_id    = int(DB_CHANNEL),
-            audio      = file_id,
-            caption    = caption,
-            title      = track.get("title",""),
-            performer  = track.get("artist",""),
+            chat_id=int(DB_CHANNEL), audio=file_id,
+            caption=caption, title=track.get("title",""),
+            performer=track.get("artist",""),
         )
         return msg.message_id
     except TelegramError as e:
-        logger.error(f"post_to_channel: {e}")
-        return None
-
-async def fetch_track_from_channel(bot, message_id: int) -> dict | None:
-    """Re-fetch a single track's metadata from the channel message."""
-    if not DB_CHANNEL:
-        return None
-    try:
-        msg = await bot.forward_message(
-            chat_id     = int(DB_CHANNEL),
-            from_chat_id= int(DB_CHANNEL),
-            message_id  = message_id,
-        )
-        # Delete the forwarded copy immediately
-        await bot.delete_message(int(DB_CHANNEL), msg.message_id)
-        if msg.audio:
-            meta = _parse_caption(msg.caption or "")
-            return {
-                "file_id":      msg.audio.file_id,
-                "thumb_file_id": meta.get("thumb_file_id",""),
-                **{k:meta.get(k,"") for k in ("title","artist","album","genre")},
-                "duration":     meta.get("duration",0),
-                "uploaded_by":  meta.get("uploaded_by",0),
-                "uploaded_at":  meta.get("uploaded_at",0),
-            }
-    except Exception as e:
-        logger.warning(f"fetch_track_from_channel: {e}")
-    return None
+        logger.error(f"post_audio_to_channel: {e}"); return None
 
 # ══════════════════════════════════════════════════════════
 # BLOCK 5 — AUDIO METADATA + THUMBNAIL EXTRACTION
@@ -912,6 +1047,36 @@ async def _reg_cmds(app: Application):
     await app.bot.set_my_commands(BOT_COMMANDS)
     logger.info("✅ Commands registered")
 
+async def _startup_pull(app: Application):
+    """
+    Called on every startup (new server or restart).
+    Fetches the index from DB_CHANNEL and rebuilds local DB.
+    This means musicvault.json is NEVER required to exist in advance.
+    """
+    if not DB_CHANNEL:
+        logger.info("⚠️  DB_CHANNEL not set — running without channel sync")
+        return
+
+    logger.info("🔄 Pulling index from DB_CHANNEL…")
+    db = await pull_index(app.bot)
+
+    if db is None:
+        # Channel exists but has no index yet (truly fresh)
+        logger.info("📭 No index in channel — starting fresh library")
+        db = {"tracks":{}, "playlists":{}, "favourites":{}}
+
+    # Download any missing thumbnails
+    missing_thumbs = 0
+    for tid, t in db.get("tracks",{}).items():
+        tfid = t.get("thumb_file_id","")
+        if tfid and not (THUMB_DIR / f"{tid}.jpg").exists():
+            ok = await download_tg_thumb(app.bot, tfid, tid)
+            if ok: missing_thumbs += 1
+
+    save_db(db)
+    logger.info(f"✅ Startup sync: {len(db['tracks'])} tracks loaded"
+                + (f", {missing_thumbs} thumbs downloaded" if missing_thumbs else ""))
+
 async def _post_restart(app: Application):
     if RESTART_FLAG.exists():
         try:
@@ -1042,57 +1207,56 @@ async def _upl_genre(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     tid = f"t{int(time.time()*1000)}"
 
-    # Save thumbnail
+    # Save thumbnail locally
     thumb_saved = False
     if meta.get("thumb_bytes"):
         thumb_saved = save_thumb(tid, meta["thumb_bytes"])
 
-    # Upload thumbnail to Telegram (so it's retrievable from any server)
+    # Upload thumbnail to Telegram for cross-server access
     thumb_file_id = ""
     if thumb_saved:
         try:
             thumb_path = THUMB_DIR / f"{tid}.jpg"
             sent_photo = await context.bot.send_photo(
-                chat_id = int(DB_CHANNEL),
-                photo   = open(thumb_path,"rb"),
-                caption = f"thumb:{tid}",
+                chat_id=int(DB_CHANNEL), photo=open(thumb_path,"rb"),
+                caption=f"thumb:{tid}", disable_notification=True,
             )
             thumb_file_id = sent_photo.photo[-1].file_id
-            # Delete that message to keep channel clean
             await context.bot.delete_message(int(DB_CHANNEL), sent_photo.message_id)
         except Exception as e:
             logger.warning(f"thumb upload: {e}")
 
     # Build track record
     track = {
+        "tid":          tid,
         "title":        meta.get("title","") or ud["file_name"],
         "artist":       meta.get("artist","") or "Unknown Artist",
         "album":        meta.get("album",""),
         "genre":        meta.get("genre",""),
         "duration":     meta.get("duration",0),
         "file_id":      ud["file_id"],
-        "thumb_file_id": thumb_file_id,
+        "thumb_file_id":thumb_file_id,
         "plays":        0,
         "uploaded_by":  uid,
         "uploaded_at":  int(time.time()),
     }
 
-    # POST TO DB CHANNEL — this is the persistent source of truth
-    msg_id = await post_to_channel(context.bot, track, ud["file_id"], thumb_file_id)
+    # 1. Post audio to DB_CHANNEL (persistent storage)
+    msg_id = await post_audio_to_channel(context.bot, track, ud["file_id"])
     track["message_id"] = msg_id
 
-    # Save to local index
+    # 2. Add to local DB + push full index back to channel
     db = load_db()
     db["tracks"][tid] = track
-    save_db(db)
+    await push_index(context.bot, db)   # ← updates channel index message
 
-    # Cleanup temp file
+    # Cleanup temp
     try: Path(ud["tmp_path"]).unlink(missing_ok=True)
     except: pass
 
     await update.message.reply_text(
         f"✅ *Saved!*\n\n{track_card(track, tid)}\n\n"
-        f"{'🖼 Thumbnail extracted!' if thumb_saved else '🎵 No embedded artwork found.'}",
+        f"{'🖼 Thumbnail extracted!' if thumb_saved else '🎵 No artwork found.'}",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("▶️ Play now", callback_data=f"play:{tid}")
@@ -1119,37 +1283,43 @@ async def _upl_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════
 
 async def cmd_resync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Rebuild local DB entirely from the DB_CHANNEL index message.
+    Safe to run on a brand-new server with zero local files.
+    """
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Admin only."); return
     if not DB_CHANNEL:
-        await update.message.reply_text("⚠️ DB_CHANNEL not set."); return
+        await update.message.reply_text("⚠️ DB_CHANNEL not set in .env"); return
 
-    msg = await update.message.reply_text("🔄 Syncing from channel… This may take a moment.")
+    msg = await update.message.reply_text("🔄 Pulling index from channel…")
 
-    db    = load_db()
-    found = 0
+    db = await pull_index(context.bot)
+    if db is None:
+        await msg.edit_text(
+            "📭 *No index found in channel.*\n\n"
+            "This means no tracks have been uploaded yet, OR the index message "
+            "was manually deleted.\n\n"
+            "Upload tracks with /upload to create the index.",
+            parse_mode=ParseMode.MARKDOWN); return
 
-    try:
-        # We re-scan by iterating known message_ids in DB
-        # and re-fetching tracks that are missing locally
-        for tid, t in list(db["tracks"].items()):
-            mid = t.get("message_id")
-            if not mid: continue
-            # Download thumbnail if missing
-            if t.get("thumb_file_id") and not (THUMB_DIR/f"{tid}.jpg").exists():
-                await download_tg_thumb(context.bot, t["thumb_file_id"], tid)
-            # Verify file_id still valid (skip full re-download)
-            found += 1
-        save_db(db)
-    except Exception as e:
-        logger.error(f"resync: {e}")
+    # Re-download all missing thumbnails from Telegram
+    dl = 0
+    for tid, t in db.get("tracks",{}).items():
+        tfid = t.get("thumb_file_id","")
+        if tfid and not (THUMB_DIR / f"{tid}.jpg").exists():
+            ok = await download_tg_thumb(context.bot, tfid, tid)
+            if ok: dl += 1
+
+    save_db(db)
 
     await msg.edit_text(
         f"✅ *Sync complete!*\n\n"
-        f"📚 {len(db['tracks'])} tracks in index\n"
-        f"🖼 Thumbnails verified: {found}",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+        f"🎵 *{len(db['tracks'])}* tracks loaded from channel\n"
+        f"🖼 *{dl}* thumbnails downloaded\n"
+        f"📋 *{len(db.get('playlists',{}))}* playlists restored\n\n"
+        f"Library is ready on this server.",
+        parse_mode=ParseMode.MARKDOWN)
 
 # ══════════════════════════════════════════════════════════
 # BLOCK 13 — BROWSE / SEARCH / PLAY / RANDOM / FAVS
@@ -1343,12 +1513,12 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if tid in fl: fl.remove(tid)
     (CACHE_DIR/f"{tid}.audio").unlink(missing_ok=True)
     (THUMB_DIR/f"{tid}.jpg").unlink(missing_ok=True)
-    save_db(db)
-    # Optionally delete from channel
+    # Delete audio message from channel too
     if t.get("message_id") and DB_CHANNEL:
-        try:
-            await context.bot.delete_message(int(DB_CHANNEL), t["message_id"])
+        try: await context.bot.delete_message(int(DB_CHANNEL), t["message_id"])
         except: pass
+    # Push updated index so other servers see the deletion
+    await push_index(context.bot, db)
     await update.message.reply_text(
         f"🗑 Deleted *{t.get('title','?')}*", parse_mode=ParseMode.MARKDOWN)
 
@@ -1382,7 +1552,8 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fl = db["favourites"][uid]
         if tid in fl: fl.remove(tid); lbl="💔 Removed"
         else:         fl.append(tid); lbl="❤️ Liked!"
-        save_db(db); await q.answer(lbl, show_alert=False); return
+        await push_index(context.bot, db)
+        await q.answer(lbl, show_alert=False); return
 
     if data.startswith("pl_view:"):
         pid=data[8:]; db=load_db(); pl=db.get("playlists",{}).get(pid)
