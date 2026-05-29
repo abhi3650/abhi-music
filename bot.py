@@ -1050,8 +1050,57 @@ BOT_COMMANDS = [
 ]
 
 async def _reg_cmds(app: Application):
-    await app.bot.set_my_commands(BOT_COMMANDS)
-    logger.info("✅ Commands registered")
+    """
+    Auto-update bot commands on every startup.
+    - Fetches what Telegram currently has
+    - Diffs against BOT_COMMANDS
+    - Only calls set_my_commands if something changed
+    - Notifies all ADMIN_IDS with a startup summary
+    """
+    bot = app.bot
+
+    # ── Fetch currently registered commands from Telegram ──
+    try:
+        current = await bot.get_my_commands()
+        current_map = {c.command: c.description for c in current}
+    except Exception as e:
+        logger.warning(f"_reg_cmds: could not fetch current commands: {e}")
+        current_map = {}
+
+    desired_map = {c.command: c.description for c in BOT_COMMANDS}
+
+    added   = [f"  /{k} — {v}" for k,v in desired_map.items() if k not in current_map]
+    removed = [f"  /{k}"       for k    in current_map         if k not in desired_map]
+    changed = [f"  /{k}  →  {v}" for k,v in desired_map.items()
+               if k in current_map and current_map[k] != v]
+
+    needs_update = bool(added or removed or changed)
+
+    if needs_update:
+        await bot.set_my_commands(BOT_COMMANDS)
+        parts = []
+        if added:   parts.append("*Added:*\n"   + "\n".join(added))
+        if removed: parts.append("*Removed:*\n" + "\n".join(removed))
+        if changed: parts.append("*Updated:*\n" + "\n".join(changed))
+        diff_text = "\n\n".join(parts)
+        logger.info(f"✅ Commands updated:\n{diff_text}")
+    else:
+        diff_text = ""
+        logger.info("✅ Commands already up to date — no changes pushed")
+
+    # ── Notify every admin ──
+    cmd_list = "\n".join(f"/{c.command} — {c.description}" for c in BOT_COMMANDS)
+    startup_msg = (
+        f"🎵 *MusicVault started!*\n\n"
+        f"🤖 Commands {'*updated* ✅' if needs_update else 'already up to date ✅'}\n\n"
+        f"{diff_text + chr(10) if diff_text else ''}"
+        f"*Active commands ({len(BOT_COMMANDS)}):*\n{cmd_list}"
+    )
+    for uid in ADMIN_IDS:
+        try:
+            await bot.send_message(uid, startup_msg, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            logger.warning(f"_reg_cmds: could not notify admin {uid}: {e}")
 
 async def _startup_pull(app: Application):
     """
