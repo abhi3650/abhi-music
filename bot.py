@@ -111,6 +111,7 @@ UPL_FILE, UPL_TITLE, UPL_ARTIST, UPL_GENRE = range(4)
 SEARCH_Q = 4
 
 APP: Application = None   # type: ignore
+BOT_LOOP: asyncio.AbstractEventLoop | None = None  # set in main(), used by HTTP thread
 
 # ══════════════════════════════════════════════════════════
 # BLOCK 4 — DATABASE
@@ -282,7 +283,7 @@ async def pull_index(bot) -> dict | None:
         chat = await bot.get_chat(cid)
         pinned = chat.pinned_message
         if pinned:
-            result = await _parse_index_message(bot, cid, pinned)
+            result = _parse_index_message(pinned)
             if result is not None:
                 _INDEX_MSG_ID = pinned.message_id
                 return result
@@ -299,22 +300,21 @@ async def _fetch_index_by_id(bot, cid: int, msg_id: int) -> dict | None:
         fwd = await bot.forward_message(cid, cid, msg_id)
         text = fwd.text or fwd.caption or ""
         await bot.delete_message(cid, fwd.message_id)
-        return _parse_index_text(bot, cid, text)
+        return _parse_index_text(text)
     except Exception as e:
         logger.warning(f"_fetch_index_by_id {msg_id}: {e}")
         return None
 
-async def _parse_index_message(bot, cid: int, msg) -> dict | None:
+def _parse_index_message(msg) -> dict | None:
     text = msg.text or msg.caption or ""
-    return _parse_index_text(bot, cid, text)
+    return _parse_index_text(text)
 
-def _parse_index_text(bot, cid: int, text: str) -> dict | None:
+def _parse_index_text(text: str) -> dict | None:
     if text.startswith(INDEX_MARKER):
         return _index_json_to_db(text)
     if text.startswith(POINTER_MARKER):
-        # Multi-chunk: fetch and reassemble synchronously can't work here
-        # so we schedule an async rebuild; for now return None to trigger resync
-        logger.info("Pointer index detected — run /resync to reassemble")
+        # Multi-chunk — pull_chunked_index handles this async; signal caller to resync
+        logger.info("Pointer index detected — run /resync to reassemble chunks")
         return None
     return None
 
@@ -1010,11 +1010,17 @@ class _H(http.server.BaseHTTPRequestHandler):
                 if not chunk: break
                 self.wfile.write(chunk); rem -= len(chunk)
 
-        # Increment plays
+        # Increment plays in local cache + schedule async channel push
         try:
-            db["tracks"][tid]["plays"] = db["tracks"][tid].get("plays",0)+1
+            db["tracks"][tid]["plays"] = db["tracks"][tid].get("plays", 0) + 1
             save_db(db)
-        except: pass
+            # Schedule push_index on the bot's asyncio loop from this HTTP thread
+            if APP and BOT_LOOP and BOT_LOOP.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    push_index(APP.bot, load_db()), BOT_LOOP
+                )
+        except Exception:
+            pass
 
     def log_message(self,*_): pass
 
@@ -1570,7 +1576,8 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pid=data[7:]; db=load_db(); uid=str(q.from_user.id)
         pl=db.get("playlists",{}).get(pid)
         if pl and str(pl.get("owner_id"))==uid:
-            del db["playlists"][pid]; save_db(db)
+            del db["playlists"][pid]
+            await push_index(context.bot, db)
             await q.edit_message_text("🗑 Playlist deleted.")
         else: await q.answer("Not your playlist",show_alert=True); return
 
@@ -1588,7 +1595,8 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pl=db.get("playlists",{}).get(pid)
         if pl and str(pl.get("owner_id"))==uid:
             if tid not in pl.setdefault("tracks",[]): pl["tracks"].append(tid)
-            save_db(db); await q.answer(f"✅ Added to {pl['name']}")
+            await push_index(context.bot, db)
+            await q.answer(f"✅ Added to {pl['name']}")
         else: await q.answer("Error",show_alert=True); return
 
     if data=="pl_new":
@@ -1634,7 +1642,7 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.setdefault("playlists",{})[pid] = {
             "name": name, "owner_id": msg.from_user.id, "tracks": []
         }
-        save_db(db)
+        await push_index(context.bot, db)
         await msg.reply_text(
             f"✅ Playlist *{name}* created!\nTap ➕ Playlist on any track to add songs.",
             parse_mode=ParseMode.MARKDOWN); return
@@ -1663,9 +1671,11 @@ def main():
 
     app = (Application.builder().token(BOT_TOKEN)
            .post_init(_reg_cmds)
+           .post_init(_startup_pull)
            .post_init(_post_restart)
            .build())
     APP = app
+    BOT_LOOP = asyncio.get_event_loop()
 
     upl_conv = ConversationHandler(
         entry_points=[CommandHandler("upload", cmd_upload)],
